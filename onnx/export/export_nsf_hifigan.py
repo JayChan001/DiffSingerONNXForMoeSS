@@ -309,14 +309,14 @@ def export(model_path):
             ),
             model_path,
             input_names=[
-                'mel',
+                'c',
                 'f0'
             ],
             output_names=[
-                'waveform'
+                'audio'
             ],
             dynamic_axes={
-                'mel': {
+                'c': {
                     1: 'n_frames',
                 },
                 'f0': {

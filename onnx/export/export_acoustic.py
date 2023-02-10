@@ -79,9 +79,18 @@ class FastSpeech2MIDILess(nn.Module):
         else:
             raise ValueError('f0_embed_type must be \'discrete\' or \'continuous\'.')
         if hparams['use_spk_id']:
-            self.spk_embed = Embedding(hparams['num_spk'], hparams['hidden_size'])
+            self.spk_embed_proj = Embedding(hparams['num_spk'], hparams['hidden_size'])
+        self.hasspk = hparams['use_spk_id']
 
     def forward(self, tokens, durations, f0, spk_embed=None):
+        if self.hasspk:
+            spk_embed_id = spk_embed
+            spk_embed_dur_id = spk_embed_id
+            spk_embed_f0_id = spk_embed_id
+            spk_embed = self.spk_embed_proj(spk_embed_id)[:, None, :]
+            spk_embed_dur = spk_embed_f0 = spk_embed
+        else:
+            spk_embed = spk_embed[0]
         durations *= tokens > 0
         mel2ph = self.lr.forward(durations)
         f0 *= mel2ph > 0
@@ -97,12 +106,8 @@ class FastSpeech2MIDILess(nn.Module):
             f0_mel = (1 + f0 / 700).log()
             pitch_embed = self.pitch_embed(f0_mel[:, :, None])
         condition = encoded + pitch_embed
-        if hparams['use_spk_id']:
-            if frozen_spk_embed is not None:
-                condition += frozen_spk_embed
-            else:
-                condition += spk_embed
-        return condition
+        condition += spk_embed
+        return condition.transpose(1, 2)
 
 
 def extract(a, t):
@@ -293,7 +298,8 @@ class MelExtractor(nn.Module):
         x = x.squeeze(1).permute(0, 2, 1)
         d = (self.spec_max - self.spec_min) / 2
         m = (self.spec_max + self.spec_min) / 2
-        return x * d + m
+        mel_out = x * d.cuda() + m.cuda()
+        return mel_out
 
 
 class GaussianDiffusion(nn.Module):
@@ -358,7 +364,7 @@ class GaussianDiffusion(nn.Module):
         del self.spec_min
         del self.spec_max
 
-    def forward(self, condition, speedup):
+    def forward(self, condition, speedup, Onnx, project_name):
         condition = condition.transpose(1, 2)  # (1, n_frames, 256) => (1, 256, n_frames)
 
         device = condition.device
@@ -367,6 +373,21 @@ class GaussianDiffusion(nn.Module):
         x = torch.randn((1, 1, self.mel_bins, n_frames), device=device)
 
         if speedup > 1:
+            if Onnx:
+                ot = step_range[0]
+                ot_1 = torch.full((1,), ot, device=device, dtype=torch.long)
+                torch.onnx.export(
+                    self.denoise_fn,
+                    (x.cuda(), ot_1.cuda(), condition.cuda()),
+                    f"onnx/{project_name}_denoise.onnx",
+                    input_names=["noise", "time", "condition"],
+                    output_names=["noise_pred"],
+                    dynamic_axes={
+                        "noise": [3],
+                        "condition": [2]
+                    },
+                    opset_version=16
+                )
             plms_noise_stage = torch.tensor(0, dtype=torch.long, device=device)
             noise_list = torch.zeros((0, 1, 1, self.mel_bins, n_frames), device=device)
             for t in step_range:
@@ -375,6 +396,19 @@ class GaussianDiffusion(nn.Module):
                 t_prev = t_prev * (t_prev > 0)
 
                 if plms_noise_stage == 0:
+                    if Onnx:
+                        torch.onnx.export(
+                            self.plms_noise_predictor,
+                            (x.cuda(), noise_pred.cuda(), t.cuda(), t_prev.cuda()),
+                            f"onnx/{project_name}_pred.onnx",
+                            input_names=["noise", "noise_pred", "time", "time_prev"],
+                            output_names=["noise_pred_o"],
+                            dynamic_axes={
+                                "noise": [3],
+                                "noise_pred": [3]
+                            },
+                            opset_version=16
+                        )
                     x_pred = self.plms_noise_predictor(x, noise_pred, t, t_prev)
                     noise_pred_prev = self.denoise_fn(x_pred, t_prev, condition)
                     noise_pred_prime = self.plms_noise_predictor.predict_stage0(noise_pred, noise_pred_prev)
@@ -391,36 +425,23 @@ class GaussianDiffusion(nn.Module):
                     plms_noise_stage = plms_noise_stage + 1
                 else:
                     noise_list = torch.cat((noise_list[-2:], noise_pred), dim=0)
-
                 x = self.plms_noise_predictor(x, noise_pred_prime, t, t_prev)
-
-            # from dpm_solver import NoiseScheduleVP, model_wrapper, DpmSolver
-            # ## 1. Define the noise schedule.
-            # noise_schedule = NoiseScheduleVP(betas=self.betas)
-            #
-            # ## 2. Convert your discrete-time `model` to the continuous-time
-            # # noise prediction model. Here is an example for a diffusion model
-            # ## `model` with the noise prediction type ("noise") .
-            #
-            # model_fn = model_wrapper(
-            #     self.denoise_fn,
-            #     noise_schedule,
-            #     model_kwargs={"cond": condition}
-            # )
-            #
-            # ## 3. Define dpm-solver and sample by singlestep DPM-Solver.
-            # ## (We recommend singlestep DPM-Solver for unconditional sampling)
-            # ## You can adjust the `steps` to balance the computation
-            # ## costs and the sample quality.
-            # dpm_solver = DpmSolver(model_fn, noise_schedule)
-            #
-            # steps = t // hparams["pndm_speedup"]
-            # x = dpm_solver.sample(x, steps=steps)
         else:
             for t in step_range:
                 pred = self.denoise_fn(x, t, condition)
                 x = self.naive_noise_predictor(x, pred, t)
-
+        if Onnx:
+            torch.onnx.export(
+                self.mel_extractor,
+                x.cuda(),
+                f"onnx/{project_name}_after.onnx",
+                input_names=["x"],
+                output_names=["mel_out"],
+                dynamic_axes={
+                    "x": [3]
+                },
+                opset_version=16
+            )
         mel = self.mel_extractor(x)
         return mel
 
@@ -474,463 +495,11 @@ class DiffusionWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, condition, speedup):
-        return self.model(condition, speedup)
+    def forward(self, condition, speedup,Onnx,project_name):
+        return self.model(condition, speedup, Onnx=Onnx, project_name=project_name)
 
-
-def _fix_cast_nodes(graph, logs=None):
-    if logs is None:
-        logs = []
-    for sub_node in graph.node:
-        if sub_node.op_type == 'If':
-            for attr in sub_node.attribute:
-                branch = onnx.helper.get_attribute_value(attr)
-                _fix_cast_nodes(branch, logs)
-        elif sub_node.op_type == 'Loop':
-            for attr in sub_node.attribute:
-                if attr.name == 'body':
-                    body = onnx.helper.get_attribute_value(attr)
-                    _fix_cast_nodes(body, logs)
-        elif sub_node.op_type == 'Cast':
-            for i, sub_attr in enumerate(sub_node.attribute):
-                if sub_attr.name == 'to':
-                    to = onnx.helper.get_attribute_value(sub_attr)
-                    if to == onnx.TensorProto.DOUBLE:
-                        float32 = onnx.helper.make_attribute('to', onnx.TensorProto.FLOAT)
-                        sub_node.attribute.remove(sub_attr)
-                        sub_node.attribute.insert(i, float32)
-                        logs.append(sub_node.name)
-                        break
-    return logs
-
-
-def _fold_shape_gather_equal_if_to_squeeze(graph, subgraph, logs=None):
-    if logs is None:
-        logs = []
-
-    # Do folding in sub-graphs recursively.
-    for node in subgraph.node:
-        if node.op_type == 'If':
-            for attr in node.attribute:
-                branch = onnx.helper.get_attribute_value(attr)
-                _fold_shape_gather_equal_if_to_squeeze(graph, branch, logs)
-        elif node.op_type == 'Loop':
-            for attr in node.attribute:
-                if attr.name == 'body':
-                    body = onnx.helper.get_attribute_value(attr)
-                    _fold_shape_gather_equal_if_to_squeeze(graph, body, logs)
-
-    # Do folding in current graph.
-    i_shape = 0
-    while i_shape < len(subgraph.node):
-        if subgraph.node[i_shape].op_type == 'Shape':
-            shape_node = subgraph.node[i_shape]
-            shape_out = shape_node.output[0]
-            i_gather = i_shape + 1
-            while i_gather < len(subgraph.node):
-                if subgraph.node[i_gather].op_type == 'Gather' and subgraph.node[i_gather].input[0] == shape_out:
-                    gather_node = subgraph.node[i_gather]
-                    gather_out = gather_node.output[0]
-                    i_equal = i_gather + 1
-                    while i_equal < len(subgraph.node):
-                        if subgraph.node[i_equal].op_type == 'Equal' and (
-                                subgraph.node[i_equal].input[0] == gather_out
-                                or subgraph.node[i_equal].input[1] == gather_out):
-                            equal_node = subgraph.node[i_equal]
-                            equal_out = equal_node.output[0]
-                            i_if = i_equal + 1
-                            while i_if < len(subgraph.node):
-                                if subgraph.node[i_if].op_type == 'If' and subgraph.node[i_if].input[0] == equal_out:
-                                    # Found the substructure to be folded.
-                                    if_node = subgraph.node[i_if]
-                                    # Search and clean initializer values.
-                                    squeeze_axes_tensor = None
-                                    for tensor in subgraph.initializer:
-                                        if tensor.name == gather_node.input[1]:
-                                            squeeze_axes_tensor = tensor
-                                            subgraph.initializer.remove(tensor)
-                                        elif tensor.name == equal_node.input[1]:
-                                            subgraph.initializer.remove(tensor)
-                                    # Create 'Squeeze' node.
-                                    squeeze_node = onnx.helper.make_node(
-                                        op_type='Squeeze',
-                                        inputs=shape_node.input,
-                                        outputs=if_node.output
-                                    )
-                                    squeeze_axes = onnx.helper.make_attribute(
-                                        key='axes',
-                                        value=[struct.unpack('q', squeeze_axes_tensor.raw_data)[0]]  # unpack int64
-                                    )
-                                    squeeze_node.attribute.extend([squeeze_axes])
-                                    # Replace 'Shape', 'Gather', 'Equal', 'If' with 'Squeeze'.
-                                    subgraph.node.insert(i_shape, squeeze_node)
-                                    subgraph.node.remove(shape_node)
-                                    subgraph.node.remove(gather_node)
-                                    subgraph.node.remove(equal_node)
-                                    subgraph.node.remove(if_node)
-                                    logs.append((shape_node.name, gather_node.name, equal_node.name, if_node.name))
-                                    break
-                                i_if += 1
-                            else:
-                                break
-                        i_equal += 1
-                    else:
-                        break
-                i_gather += 1
-            else:
-                break
-        i_shape += 1
-    return logs
-
-
-def _extract_conv_nodes(graph, weight_pattern, alias_prefix):
-    node_dict = {}  # key: pattern match, value: (alias, node)
-    logs = []
-
-    def _extract_conv_nodes_recursive(subgraph):
-        to_be_removed = []
-        for sub_node in subgraph.node:
-            if sub_node.op_type == 'If':
-                for attr in sub_node.attribute:
-                    branch = onnx.helper.get_attribute_value(attr)
-                    _extract_conv_nodes_recursive(branch)
-            elif sub_node.op_type == 'Loop':
-                for attr in sub_node.attribute:
-                    if attr.name == 'body':
-                        body = onnx.helper.get_attribute_value(attr)
-                        _extract_conv_nodes_recursive(body)
-            elif sub_node.op_type == 'Conv' and re.match(weight_pattern, sub_node.input[1]):
-                # Found node to extract
-                cached = node_dict.get(sub_node.input[1])
-                if cached is None:
-                    out_alias = f'{alias_prefix}.{len(node_dict)}'
-                    node_dict[sub_node.input[1]] = (out_alias, sub_node)
-                else:
-                    out_alias = cached[0]
-                out = sub_node.output[0]
-                # Search for nodes downstream the extracted node and match them to the renamed output
-                for dep_node in subgraph.node:
-                    for dep_idx, dep_input in enumerate(dep_node.input):
-                        if dep_input == out:
-                            dep_node.input.remove(out)
-                            dep_node.input.insert(dep_idx, out_alias)
-                # Add the node to the remove list
-                to_be_removed.append(sub_node)
-                logs.append(sub_node.name)
-        [subgraph.node.remove(_n) for _n in to_be_removed]
-
-    for i, n in enumerate(graph.node):
-        if n.op_type == 'If':
-            for a in n.attribute:
-                b = onnx.helper.get_attribute_value(a)
-                _extract_conv_nodes_recursive(b)
-            for key in reversed(node_dict):
-                alias, node = node_dict[key]
-                # Rename output of the node
-                out_name = node.output[0]
-                node.output.remove(node.output[0])
-                node.output.insert(0, alias)
-                # Insert node into the main graph
-                graph.node.insert(i, node)
-                # Rename value info of the output
-                for v in graph.value_info:
-                    if v.name == out_name:
-                        v.name = alias
-                        break
-            break
-    return logs
-
-
-def _remove_unused_values(graph):
-    used_values = set()
-    cleaned_values = []
-
-    def _record_usage_recursive(subgraph):
-        for node in subgraph.node:
-            # For 'If' and 'Loop' nodes, do recording recursively
-            if node.op_type == 'If':
-                for attr in node.attribute:
-                    branch = onnx.helper.get_attribute_value(attr)
-                    _record_usage_recursive(branch)
-            elif node.op_type == 'Loop':
-                for attr in node.attribute:
-                    if attr.name == 'body':
-                        body = onnx.helper.get_attribute_value(attr)
-                        _record_usage_recursive(body)
-            # For each node, record its inputs and outputs
-            for input_value in node.input:
-                used_values.add(input_value)
-            for output_value in node.output:
-                used_values.add(output_value)
-
-    def _clean_unused_recursively(subgraph):
-        # Do cleaning in sub-graphs recursively.
-        for node in subgraph.node:
-            if node.op_type == 'If':
-                for attr in node.attribute:
-                    branch = onnx.helper.get_attribute_value(attr)
-                    _clean_unused_recursively(branch)
-            elif node.op_type == 'Loop':
-                for attr in node.attribute:
-                    if attr.name == 'body':
-                        body = onnx.helper.get_attribute_value(attr)
-                        _clean_unused_recursively(body)
-
-        # Do cleaning in current graph.
-        i = 0
-        while i < len(subgraph.initializer):
-            if subgraph.initializer[i].name not in used_values:
-                cleaned_values.append(subgraph.initializer[i].name)
-                subgraph.initializer.remove(subgraph.initializer[i])
-            else:
-                i += 1
-        i = 0
-        while i < len(subgraph.value_info):
-            if subgraph.value_info[i].name not in used_values:
-                cleaned_values.append(subgraph.value_info[i].name)
-                subgraph.value_info.remove(subgraph.value_info[i])
-            else:
-                i += 1
-
-    _record_usage_recursive(graph)
-    _clean_unused_recursively(graph)
-    return cleaned_values
-
-
-def _add_prefixes(model,
-                  initializer_prefix=None,
-                  value_info_prefix=None,
-                  node_prefix=None,
-                  dim_prefix=None,
-                  ignored_pattern=None):
-    initializers = set()
-    value_infos = set()
-
-    def _record_initializers_and_value_infos_recursive(subgraph):
-        # Record names in current graph
-        for initializer in subgraph.initializer:
-            if re.match(ignored_pattern, initializer.name):
-                continue
-            initializers.add(initializer.name)
-        for value_info in subgraph.value_info:
-            if re.match(ignored_pattern, value_info.name):
-                continue
-            value_infos.add(value_info.name)
-        for node in subgraph.node:
-            # For 'If' and 'Loop' nodes, do recording recursively
-            if node.op_type == 'If':
-                for attr in node.attribute:
-                    branch = onnx.helper.get_attribute_value(attr)
-                    _record_initializers_and_value_infos_recursive(branch)
-            elif node.op_type == 'Loop':
-                for attr in node.attribute:
-                    if attr.name == 'body':
-                        body = onnx.helper.get_attribute_value(attr)
-                        _record_initializers_and_value_infos_recursive(body)
-
-    def _add_prefixes_recursive(subgraph):
-        # Add prefixes in current graph
-        if initializer_prefix is not None:
-            for initializer in subgraph.initializer:
-                if re.match(ignored_pattern, initializer.name):
-                    continue
-                initializer.name = initializer_prefix + initializer.name
-        for value_info in subgraph.value_info:
-            if dim_prefix is not None:
-                for dim in value_info.type.tensor_type.shape.dim:
-                    if dim.dim_param is None or dim.dim_param == '' or re.match(ignored_pattern, dim.dim_param):
-                        continue
-                    dim.dim_param = dim_prefix + dim.dim_param
-            if value_info_prefix is None or re.match(ignored_pattern, value_info.name):
-                continue
-            value_info.name = value_info_prefix + value_info.name
-        if node_prefix is not None:
-            for node in subgraph.node:
-                if re.match(ignored_pattern, node.name):
-                    continue
-                node.name = node_prefix + node.name
-        for node in subgraph.node:
-            # For 'If' and 'Loop' nodes, rename recursively
-            if node.op_type == 'If':
-                for attr in node.attribute:
-                    branch = onnx.helper.get_attribute_value(attr)
-                    _add_prefixes_recursive(branch)
-            elif node.op_type == 'Loop':
-                for attr in node.attribute:
-                    if attr.name == 'body':
-                        body = onnx.helper.get_attribute_value(attr)
-                        _add_prefixes_recursive(body)
-            # For each node, rename its inputs and outputs
-            for i, input_value in enumerate(node.input):
-                if input_value in initializers and initializer_prefix is not None:
-                    node.input.remove(input_value)
-                    node.input.insert(i, initializer_prefix + input_value)
-                if input_value in value_infos and value_info_prefix is not None:
-                    node.input.remove(input_value)
-                    node.input.insert(i, value_info_prefix + input_value)
-            for i, output_value in enumerate(node.output):
-                if output_value in initializers and initializer_prefix is not None:
-                    node.output.remove(output_value)
-                    node.output.insert(i, initializer_prefix + output_value)
-                if output_value in value_infos and value_info_prefix is not None:
-                    node.output.remove(output_value)
-                    node.output.insert(i, value_info_prefix + output_value)
-
-    _record_initializers_and_value_infos_recursive(model.graph)
-    _add_prefixes_recursive(model.graph)
-
-
-def fix(src, target):
-    model = onnx.load(src)
-
-    # The output dimension are wrongly hinted by TorchScript
-    in_dims = model.graph.input[0].type.tensor_type.shape.dim
-    out_dims = model.graph.output[0].type.tensor_type.shape.dim
-    out_dims.remove(out_dims[1])
-    out_dims.insert(1, in_dims[1])
-    print(f'| annotate output: \'{model.graph.output[0].name}\'')
-
-    # Fix 'Cast' nodes in sub-graphs that wrongly cast tensors to float64
-    fixed_casts = _fix_cast_nodes(model.graph)
-    print('| fix node(s): ')
-    for i, log in enumerate(fixed_casts):
-        if i == len(fixed_casts) - 1:
-            end = '\n'
-        elif i % 10 == 9:
-            end = ',\n'
-        else:
-            end = ', '
-        print(f'\'{log}\'', end=end)
-
-    # Run #1 of the simplifier to fix missing value info and type hints and remove unnecessary 'Cast'.
-    print('Running ONNX simplifier...')
-    model, check = onnxsim.simplify(model, include_subgraph=True)
-    assert check, 'Simplified ONNX model could not be validated'
-
-    in_dims = model.graph.input[0].type.tensor_type.shape.dim
-    out_dims = model.graph.output[0].type.tensor_type.shape.dim
-
-    then_branch = None
-    for node in model.graph.node:
-        if node.op_type == 'If':
-            # Add type hint to let the simplifier fold 'Shape', 'Gather', 'Equal', 'If' to 'Squeeze'
-            if_out = node.output[0]
-            for info in model.graph.value_info:
-                if info.name == if_out:
-                    if_out_dim = info.type.tensor_type.shape.dim
-                    while len(if_out_dim) > 0:
-                        if_out_dim.remove(if_out_dim[0])
-                    if_out_dim.insert(0, in_dims[0])  # batch_size
-                    if_out_dim.insert(1, in_dims[0])  # 1
-                    if_out_dim.insert(2, out_dims[2])  # mel_bins
-                    if_out_dim.insert(3, in_dims[1])  # n_frames
-                    print(f'| annotate node: \'{node.name}\'')
-
-            # Manually fold 'Shape', 'Gather', 'Equal', 'If' to 'Squeeze' in sub-graphs
-            folded_groups = []
-            for attr in node.attribute:
-                branch = onnx.helper.get_attribute_value(attr)
-                folded_groups += _fold_shape_gather_equal_if_to_squeeze(model.graph, branch)
-                if attr.name == 'then_branch':
-                    # Save branch for future use
-                    then_branch = branch
-            print('| fold node group(s): ')
-            print(', '.join(['[' + ', '.join([f'\'{n}\'' for n in log]) + ']' for log in folded_groups]))
-            break
-
-    # Optimize 'Concat' nodes for shapes
-    concat_node = None
-    shape_prefix_name = 'noise.shape.prefix'
-    list_length_name = 'list.length'
-    for node in model.graph.node:
-        if node.op_type == 'Concat':
-            concat_node = node
-            for i, ini in enumerate(model.graph.initializer):
-                if ini.name == node.input[0]:
-                    shape_prefix = onnx.helper.make_tensor(
-                        name=shape_prefix_name,
-                        data_type=onnx.TensorProto.INT64,
-                        dims=(3,),
-                        vals=[out_dims[0].dim_value, 1, out_dims[2].dim_value]
-                    )
-                    list_length = onnx.helper.make_tensor(
-                        name=list_length_name,
-                        data_type=onnx.TensorProto.INT64,
-                        dims=(1,),
-                        vals=[0]
-                    )
-                    model.graph.initializer.extend([shape_prefix, list_length])
-                    break
-            for i in range(3):
-                node.input.remove(node.input[0])
-            node.input.insert(0, shape_prefix_name)
-            print(f'| optimize node: \'{node.name}\'')
-            break
-    for node in then_branch.node:
-        if node.op_type == 'Concat':
-            concat_inputs = list(node.input)
-            dep_nodes = []
-            for dep_node in then_branch.node:
-                if dep_node.op_type == 'Unsqueeze' and dep_node.output[0] in concat_inputs:
-                    dep_nodes.append(dep_node)
-            [then_branch.node.remove(d_n) for d_n in dep_nodes]
-            while len(node.input) > 0:
-                node.input.remove(node.input[0])
-            node.input.extend([list_length_name, concat_node.output[0]])
-            print(f'| optimize node: \'{node.name}\'')
-            break
-
-    # Extract 'Conv' nodes and cache results of conditioner projection
-    # of each residual layer from loop bodies to improve performance.
-    extracted_convs = _extract_conv_nodes(
-        model.graph,
-        r'model\.denoise_fn\.residual_layers\.\d+\.conditioner_projection\.weight',
-        'cache'
-    )
-
-    print(f'| extract node(s):')
-    for i, log in enumerate(extracted_convs):
-        if i == len(extracted_convs) - 1:
-            end = '\n'
-        elif i % 10 == 9:
-            end = ',\n'
-        else:
-            end = ', '
-        print(f'\'{log}\'', end=end)
-
-    # Remove unused initializers and value infos
-    cleaned_values = _remove_unused_values(model.graph)
-    print(f'| clean value(s):')
-    for i, log in enumerate(cleaned_values):
-        if i == len(cleaned_values) - 1:
-            end = '\n'
-        elif i % 15 == 14:
-            end = ',\n'
-        else:
-            end = ', '
-        print(f'\'{log}\'', end=end)
-
-    # Run #2 of the simplifier to further optimize the graph and reduce dangling sub-graphs.
-    print('Running ONNX simplifier...')
-    model, check = onnxsim.simplify(model, include_subgraph=True)
-    assert check, 'Simplified ONNX model could not be validated'
-
-    onnx.save(model, target)
-    print('Graph fixed and optimized.')
-
-
-def _perform_speaker_mix(spk_embedding: nn.Embedding, spk_map: dict, spk_mix_map: dict, device):
-    for spk_name in spk_mix_map:
-        assert spk_name in spk_map, f'Speaker \'{spk_name}\' not found.'
-    spk_mix_embed = [
-        spk_embedding(torch.LongTensor([spk_map[spk_name]]).to(device)) * spk_mix_map[spk_name]
-        for spk_name in spk_mix_map
-    ]
-    spk_mix_embed = torch.stack(spk_mix_embed, dim=1).sum(dim=1)
-    return spk_mix_embed
-
-
-def export(fs2_path, diff_path, spk_export_list=None, frozen_spk=None):
+def export(name=None,Onnx=False):
+    set_hparams(print_hparams=False)
     if hparams.get('use_midi', True) or not hparams['use_pitch_embed']:
         raise NotImplementedError('Only checkpoints of MIDI-less mode are supported.')
 
@@ -945,32 +514,14 @@ def export(fs2_path, diff_path, spk_export_list=None, frozen_spk=None):
 
     with torch.no_grad():
         # Export speakers and speaker mixes
-        global frozen_spk_embed
-        if hparams['use_spk_id']:
-            if spk_export_list is None and frozen_spk is None:
-                warnings.warn('Combined models cannot run without speaker keys. '
-                              'Did you forget to export at least one speaker via the \'--spk\' argument, '
-                              'or freeze one speaker via the \'--freeze_spk\' argument?', category=UserWarning)
-                warnings.filterwarnings(action='default')
-            with open(os.path.join(hparams['work_dir'], 'spk_map.json'), 'r', encoding='utf8') as f:
-                spk_map = json.load(f)
-            if frozen_spk is not None:
-                frozen_spk_embed = _perform_speaker_mix(fs2.model.fs2.spk_embed, spk_map,
-                                                        parse_commandline_spk_mix(frozen_spk), device)
-            elif spk_export_list is not None:
-                for spk in spk_export_list:
-                    np.save(spk['path'], _perform_speaker_mix(
-                        fs2.model.fs2.spk_embed, spk_map, parse_commandline_spk_mix(spk['mix']), device
-                    ).cpu().numpy())
-
-        # Export PyTorch modules
         n_frames = 10
         tokens = torch.tensor([[3]], dtype=torch.long, device=device)
         durations = torch.tensor([[n_frames]], dtype=torch.long, device=device)
         f0 = torch.tensor([[440.] * n_frames], dtype=torch.float32, device=device)
+        spk_embed = torch.LongTensor([0])
         kwargs = {}
-        arguments = (tokens, durations, f0, kwargs)
-        input_names = ['tokens', 'durations', 'f0']
+        arguments = (tokens, durations, f0, spk_embed)
+        input_names = ['tokens', 'durations', 'f0', 'spk_embed']
         dynamix_axes = {
             'tokens': {
                 1: 'n_tokens'
@@ -982,161 +533,28 @@ def export(fs2_path, diff_path, spk_export_list=None, frozen_spk=None):
                 1: 'n_frames'
             }
         }
-        if hparams['use_spk_id'] and frozen_spk is None:
-            # noinspection PyTypedDict
-            kwargs['spk_embed'] = torch.rand((1, n_frames, hparams['hidden_size']), dtype=torch.float32, device=device)
-            input_names.append('spk_embed')
-            dynamix_axes['spk_embed'] = {
-                1: 'n_frames'
-            }
-        print('Exporting FastSpeech2...')
-        torch.onnx.export(
-            fs2,
-            arguments,
-            fs2_path,
-            input_names=input_names,
-            output_names=[
-                'condition'
-            ],
-            dynamic_axes=dynamix_axes,
-            opset_version=11
-        )
-        model = onnx.load(fs2_path)
-        model, check = onnxsim.simplify(model, include_subgraph=True)
-        assert check, 'Simplified ONNX model could not be validated'
-        onnx.save(model, fs2_path)
-
+        print('Exporting Encoder...')
+        if Onnx:
+            torch.onnx.export(
+                fs2,
+                arguments,
+                f"onnx/{name}_encoder.onnx",
+                input_names=input_names,
+                output_names=[
+                    'condition'
+                ],
+                dynamic_axes=dynamix_axes,
+                opset_version=11
+            )
         shape = (1, 1, hparams['audio_num_mel_bins'], n_frames)
-        noise_t = torch.randn(shape, device=device)
-        noise_list = torch.randn((3, *shape), device=device)
-        condition = torch.rand((1, hparams['hidden_size'], n_frames), device=device)
-        step = (torch.rand((), device=device) * hparams['K_step']).long()
-        speedup = (torch.rand((), device=device) * step / 10.).long()
-        step_prev = torch.maximum(step - speedup, torch.tensor(0, dtype=torch.long, device=device))
-
-        print('Tracing GaussianDiffusion submodules...')
-        diffusion.model.denoise_fn = torch.jit.trace(
-            diffusion.model.denoise_fn,
-            (
-                noise_t,
-                step,
-                condition
-            )
-        )
-        diffusion.model.naive_noise_predictor = torch.jit.trace(
-            diffusion.model.naive_noise_predictor,
-            (
-                noise_t,
-                noise_t,
-                step
-            ),
-            check_trace=False
-        )
-        diffusion.model.plms_noise_predictor = torch.jit.trace_module(
-            diffusion.model.plms_noise_predictor,
-            {
-                'forward': (
-                    noise_t,
-                    noise_t,
-                    step,
-                    step_prev
-                ),
-                'predict_stage0': (
-                    noise_t,
-                    noise_t
-                ),
-                'predict_stage1': (
-                    noise_t,
-                    noise_list
-                ),
-                'predict_stage2': (
-                    noise_t,
-                    noise_list
-                ),
-                'predict_stage3': (
-                    noise_t,
-                    noise_list
-                ),
-            }
-        )
-        diffusion.model.mel_extractor = torch.jit.trace(
-            diffusion.model.mel_extractor,
-            (
-                noise_t
-            )
-        )
-
-        diffusion = torch.jit.script(diffusion)
         condition = torch.rand((1, n_frames, hparams['hidden_size']), device=device)
         speedup = torch.tensor(10, dtype=torch.long, device=device)
-        dummy = diffusion.forward(condition, speedup)
+        dummy = diffusion.forward(condition, speedup,Onnx=Onnx,project_name=name)
 
-        torch.onnx.export(
-            diffusion,
-            (
-                condition,
-                speedup
-            ),
-            diff_path,
-            input_names=[
-                'condition',
-                'speedup'
-            ],
-            output_names=[
-                'mel'
-            ],
-            dynamic_axes={
-                'condition': {
-                    1: 'n_frames'
-                }
-            },
-            opset_version=11,
-            example_outputs=(
-                dummy
-            )
-        )
         print('PyTorch ONNX export finished.')
-
-
-def merge(fs2_path, diff_path, target_path):
-    fs2_model = onnx.load(fs2_path)
-    diff_model = onnx.load(diff_path)
-
-    # Add prefixes to names inside the model graph.
-    print('Adding prefixes to models...')
-    _add_prefixes(
-        fs2_model, initializer_prefix='fs2.', value_info_prefix='fs2.',
-        node_prefix='Enc_', ignored_pattern=r'model\.fs2\.'
-    )
-    _add_prefixes(
-        fs2_model, dim_prefix='enc__', ignored_pattern=r'(n_tokens)|(n_frames)'
-    )
-    _add_prefixes(
-        diff_model, initializer_prefix='diffusion.', value_info_prefix='diffusion.',
-        node_prefix='Dec_', ignored_pattern=r'model.'
-    )
-    _add_prefixes(
-        diff_model, dim_prefix='dec__', ignored_pattern='n_frames'
-    )
-    # Official onnx API does not consider sub-graphs.
-    # onnx.compose.add_prefix(fs2_model, prefix='fs2.', inplace=True)
-    # onnx.compose.add_prefix(diff_model, prefix='diffusion.', inplace=True)
-
-    merged_model = onnx.compose.merge_models(
-        fs2_model, diff_model, io_map=[('condition', 'condition')],
-        prefix1='', prefix2='', doc_string=''
-    )
-    merged_model.graph.name = fs2_model.graph.name
-    print('FastSpeech2 and GaussianDiffusion models merged.')
-    onnx.save(merged_model, target_path)
-
-def export_phonemes_txt(phonemes_txt_path:str):
-    textEncoder = TokenTextEncoder(vocab_list=build_phoneme_list())
-    textEncoder.store_to_file(phonemes_txt_path)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Export DiffSinger acoustic model to ONNX format.')
-    parser.add_argument('--exp', type=str, required=True, help='experiment to export')
     parser.add_argument('--target', required=False, type=str, help='path of the target ONNX model')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--spk', required=False, type=str, action='append',
@@ -1154,7 +572,7 @@ if __name__ == '__main__':
     if args.spk is not None:
         raise NotImplementedError('Exporting speakers or speaker mixes is not supported yet.')
 
-    exp = args.exp
+    exp = "utagoe"
     cwd = os.getcwd()
     if args.out:
         out = os.path.join(cwd, args.out) if not os.path.isabs(args.out) else args.out
@@ -1206,20 +624,6 @@ if __name__ == '__main__':
         target_model_path = f'{out}/{exp}.onnx'
     else:
         target_model_path = f'{out}/{exp}.{frozen_spk_name}.onnx'
-    phonemes_txt_path =f'{out}/{exp}.phonemes.txt' 
     os.makedirs(out, exist_ok=True)
-    set_hparams(print_hparams=False)
-    export(fs2_path=fs2_model_path, diff_path=diff_model_path,
-           spk_export_list=spk_export_paths, frozen_spk=frozen_spk_mix)
-    fix(diff_model_path, diff_model_path)
-    merge(fs2_path=fs2_model_path, diff_path=diff_model_path, target_path=target_model_path)
-    export_phonemes_txt(phonemes_txt_path)
-    os.remove(fs2_model_path)
-    os.remove(diff_model_path)
-
-    os.chdir(cwd)
-    if args.target:
-        log_path = os.path.abspath(args.out)
-    else:
-        log_path = out
-    print(f'| export \'model\' to \'{log_path}\'.')
+    export(name=exp,Onnx=True)
+    
